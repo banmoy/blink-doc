@@ -54,15 +54,13 @@ class CopyOnWriteStateTableSnapshot<K, N, S> {
 
 snapshot创建过程(同步执行)：
 * 将`map.table`拷贝到`snapshot.snapshotData`
-* `snapshot.snapshotVersion = map.stateTableVersion`
-* 将`map.stateTableVersion`添加到`map.snapshotVersions`
 * `++map.stateTableVersion`
-* `map.highestRequiredSnapshotVersion = map.stateTableVersion`
-
+* 更新未完成snapshot的最高版本号，`map.highestRequiredSnapshotVersion = map.stateTableVersion`，并添加到未完成snapshot集合`map.snapshotVersions`中
+* snapshot版本号设为`map.stateTableVersion`
 
 snapshot释放过程(异步执行)：
-* 将`snapshot.snapshotVersion`从`map.snapshotVersions`中移除
-* `map.highestRequiredSnapshotVersion = map.snapshotVersions.last()`
+* 将snapshot版本号`snapshotVersion`从未完成集合`map.snapshotVersions`中移除
+* 更新未完成snapshot的最高版本号，`map.highestRequiredSnapshotVersion = map.snapshotVersions.last()`
 
 
 copy-on-write的两个原则：
@@ -73,120 +71,107 @@ copy-on-write的两个原则：
 > 注意：用户得到state后可能进行修改，如果此时某个snapshot正在使用这个state，就会出现竞争，因此即便在进行`map.get`操作时也要将state进行拷贝，而`key`和`namespace`没有进行拷贝是因为这两个变量只在Flink内部使用，用户不会得到
 
 
-下面通过例子来说明copy-on-write机制，依次进行操作`snapshot()`、`put(13, 2)`、`get(23)`、`get(42)`、`release(0)`、`snapshot()`、`remove(23)`、`release()`
+下面通过例子来说明copy-on-write机制
 
  _**初始状态**_
 
- * `stateTableVersion`和`hightestRequriedVersion`初始值为0
- * `K`对应`entry.key`与`entry.namespace`的组合，`S`对应`entry.state`  
+ * `stateTableVersion`和`hightestRequriedVersion`初始值为`0`
+ * `K`表示`entry.key`与`entry.namespace`的组合，`S`表示`entry.state`  
   ![1.png | center](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/b1db87ed-147f-4608-8525-f6ee3535a12b.png "")
 
 
 **_snapshot()_**
 
-
-* 将`map.table`拷贝到`snapshot.snapshotData`，snapshot版本号为0
-* 将`stateTableVersion`和`hightestRequriedStateTableVersion`更新为1  
-  ![2.png | center](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/61048d51-c556-4d73-8156-69c2beab067a.png "")
+* 将`stateTableVersion`和`hightestRequriedVersion`更新为`1`
+* 将`map.table`拷贝到`snapshot.snapshotData`，snapshot版本号为`1`
+ ![2.png](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/c5c83e35-a153-4a14-9a2e-27e7ca4f8892.png) 
 
 
 **_put(13, 2)_**
 
-
-* map中没有`K:13`，不存在竞争，直接添加entry，将其`stateVersion`和`entryVersion`设为1  
-  ![3.png | center](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/b70974ad-9b96-4648-b520-72f67701c78f.png "")
-
+* map中没有`K:13`，直接添加entry，将其`stateVersion`和`entryVersion`设为`1`  
+  ![3.png](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/5da5e1d2-842c-478c-88ac-6a4ca632465b.png) 
 
 **_get(23)_**
 
-
 * `stateVersion < highestRequiredVersion`，应用规则2，将`S:3`进行拷贝
-* 应用规则1处理entry，因为`entryVersion < highestRequiredVersion`，说明entry正在被snapshot使用，需要进行拷贝，并将`stateVersion`和`entryVersion`设为1，`K`指向原来的值，`S`指向拷贝得到的值
-* 需要修改前一个entry的`next`，再次应用规则1，拷贝entry，`stateVersion`和`entryVersion`设为1，`K`和`S`均指向原来的值，`next`指向上一步中得到的entry  
-  ![4.png | center](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/57010e28-0187-463e-b9f4-0ee76a36ea93.png "")
+* 应用规则1处理entry，因为`entryVersion < highestRequiredVersion`，说明entry正在被snapshot使用，需要进行拷贝，并将`stateVersion`和`entryVersion`设为`1`，`K`指向原来的值，`S`指向拷贝得到的值
+* 需要修改前一个entry`K:42`的`next`，再次应用规则1，拷贝entry，`stateVersion`不变依然为`0`，`entryVersion`设为`1`，`K`和`S`均指向原来的值，`next`指向上一步中得到的entry
+* table指向新的entry`K:42`
+ ![4.png](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/d3bf5fbc-99d6-43ca-b4e9-bb3fb956e2bd.png) 
 
 
 **_get(42)_**
 
-
 * `stateVersion < highestRequiredVersion`，应用规则2，将`S:7`进行拷贝
 * 应用规则1处理entry，因为`entryVersion == highestRequiredVersion`，说明没有snapshot在使用entry，因此不需要拷贝，只需将`S`指向新的state，并设置`stateVersion`为1  
-  ![5.png | center](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/3564964c-9fb1-401d-8251-49d9c2023732.png "")
+  ![5.png](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/115b108c-565a-4357-be7e-6aed95c11969.png) 
 
+**_release(1)_**
+释放版本号为1的snapshot
 
-**_release(0)_**
-释放版本号为0的snapshot
-
-
-* 将版本号0从`map.snapshotVersions`中移除，更新`highestRequriedVersion`为0，表示目前没有执行任何snapshot
+* 将版本号`1`从`map.snapshotVersions`中移除，更新`highestRequriedVersion`为0，表示目前没有任何snapshot正在执行
 * snapshot取消对`snapshotData`的引用，释放占用的空间  
-  ![6.png | center](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/9c7a19b5-9a4e-48a2-af9c-5618ee96a760.png "")
+  ![6.png](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/8034565d-af65-45e4-8b25-6489529ae29f.png) 
 
 
 **_snapshot()_**
 
-* 将`map.table`拷贝到`snapshot.snapshotData`，snapshot版本号为1
-* 将`stateTableVersion`和`hightestRequriedVersion`更新为2  
-  ![7.png | center](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/df02a7e9-4567-4007-ad98-bbb986fd99a0.png "")
-
+* 将`stateTableVersion`和`hightestRequriedVersion`更新为`2`
+* 将`map.table`拷贝到`snapshot.snapshotData`，snapshot版本号为`2`
+![7.png](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/e3a215e7-7c40-4e21-9d1d-339f252be73f.png) 
 
 **_remove(23)_**
 
+* 需要将`K:23`前一个entry`K:42`的`next`设为`null`，应用规则1，`entryVersion < hightestRequriedVersion`，因此需要拷贝，并将`entryVersion`设为2，`K`和`S`指向原来的值
+* 将table指向新的entry`K:42`
+ ![8.png](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/9c236ffa-6a04-47bf-ba69-ae78f04a7fb1.png) 
 
-* 需要将`K:23`前一个entry的`next`设为`null`，前一个entry为`K:42`，应用规则1，`entryVersion < hightestRequriedVersion`，因此需要拷贝，并将`entryVersion`设为2，`K`和`State`指向原来的值
-* `K:42`为链表头，只需将table指向拷贝后的entry即可  
-  ![8.png | center](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/7a4a4bac-c423-4f8c-aa7f-ad82f19e93eb.png "")
-
-
-**_release(1)_**  
-   释放版本号为1的snapshot
-
-
-* 将版本号1从`map.snapshotVersions`中移除，更新`highestRequriedVersion`为0，表示目前没有执行任何snapshot
+**_release(2)_**  
+释放版本号为2的snapshot
+* 将版本号`2`从`map.snapshotVersions`中移除，更新`highestRequriedVersion`为0
 * snapshot取消对`snapshotData`的引用，释放占用的空间  
-  ![9.png | center](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/541c4afc-752b-4ebc-b130-4fd930fd1af4.png "")
+![9.png](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/b97f1ce1-de25-4eab-b131-25a648d2de3d.png) 
 
 
 ### Incremental rehash(渐进式rehash)
-为了避免碰撞带来的性能下降，当hash map中的元素个数超过阈值后，会申请容量更大的map，并将元素rehash。如果map中的元素很多，一次性rehash所有元素将会阻塞正常的处理流程，从而导致一段时间内性能下降。渐进式rehash将整个过程平摊到对map的每次操作(get，put，remove)中，如果map正在rehash，那么操作前先rehash一定数量的元素。渐进式rehash增加了每次map操作的代价，但提高了系统的稳定性。
+hash map为了避免碰撞带来的性能下降，在元素个数超过阈值后会申请更大的空间，并将元素rehash。如果map中的元素很多，一次性rehash所有元素将会阻塞正常的处理流程，从而导致一段时间内性能下降。渐进式rehash将整个过程平摊到对map的每次操作(get，put，remove)中，如果map正在rehash，那么操作前先rehash一定数量的元素。渐进式rehash增加了每次map操作的代价，但提高了系统的稳定性。
 
 下面通过例子来解释rehash的过程
 
 **_初始状态_**
 *  `oldCap`:  old map的容量
 *  `newCap`:  new map的容量(`oldCap`的两倍)
-*  `rehashIdx`: old map中下一个应该被rehash的桶的索引，初始值为`0`
+*  `rehashIdx`: old map中下一个应该被rehash的桶的索引，初始值为`0`，每次rehash结束加`1`
 *  每次rehash一个桶中所有的元素
 ![1.png](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/7eb8d8ea-1ec7-4ab8-8478-3dce0e99e381.png) 
 
 **_get(0)_**
 
-* 将old map中桶0的所有元素rehash，`K:0`移到new map中，`rehashIdx`加1变为1
-* 判断`K:0`在哪个map中，方法是比较`k%oldCap`与`rehashIdx`的大小，如果前者小则说明该元素如果存在一定被rehash到了new map中，否则仍在old map中，据此可知要在new map中查找`K:0`
+* 将old map中桶0的所有元素rehash，`K:0`移到new map中，`rehashIdx`加`1`变为`1`
+* 判断`K:0`在哪个map中，方法是比较`k % oldCap`与`rehashIdx`的大小，如果前者小则说明该元素如果存在一定被rehash到了new map中，否则仍在old map中，这里`K:0`要在new map中查找
 * 在new map中查找`K:0`并返回`V:2`
 
 ![2.png](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/f142cc61-5d38-4cf5-9a46-55f4d0eba5b4.png) 
 
 **_put(3, 5)_**
 
-* 将old map中桶1的所有元素rehash，`K:1`和`K:5`移到new map中，`rehashIdx`变为2
-* 计算`3%4 > rehashIdx(2)`，在old map中查找`K:3`
+* 将old map中桶1的所有元素rehash，`K:1`和`K:5`移到new map中，`rehashIdx`更新为`2`
+* `3 % 4 > rehashIdx`，在old map中查找`K:3`
 * old map中不存在`K:3`，需要插入新的元素，同样应该插入到old map中
 
 ![3.png](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/b43b8df5-b7b5-4e0f-899f-7201f618f18f.png) 
 
 **_remove(1)_**
-* 将old map中桶2的所有元素rehash，`K:2`移到new map中，`rehashIdx`变为3
-* 计算`1%4 < rehashIdx(3)`，在new map中查找`K:1`
+* 将old map中桶2的所有元素rehash，`K:6`移到new map中，`rehashIdx`更新为`3`
+* `1 % 4 < rehashIdx`，在new map中查找`K:1`
 * 找到`K:1`并移除
-
-![4.png](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/8f4fb22d-b9f9-4888-978f-f47f7c8d53af.png) 
+![4.png](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/d55c6ff7-03cb-4e64-8513-6d30cf728df6.png) 
 
 **_get(5)_**
-* 将old map中桶3的所有元素rehash，`K:3`移到new map中，`rehashIdx`变为4，此时`rehashIdx == oldCap`，说明rehash完成，old map可以丢弃，将new map变为old map
-* 在old map中查找`K:5`并返回`V:7`
-
-![5.png](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/e5246898-37e4-47b1-919e-49e468502c37.png) 
+* 将old map中桶3的所有元素rehash，`K:3`移到new map中，`rehashIdx`更新为`4`，此时`rehashIdx == oldCap`，说明rehash完成，old map可以丢弃，同时rehashIdx重置为`0`
+* 在new map中查找`K:5`并返回`V:7`
+![5.png](https://private-alipayobjects.alipay.com/alipay-rmsdeploy-image/skylark/png/5485ae22-716e-48ae-8a80-97bb13a1a565.png) 
 
 
 ### 参考资料
